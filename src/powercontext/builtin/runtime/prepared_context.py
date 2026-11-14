@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -45,6 +46,7 @@ from powercontext.builtin.runtime.prepared_text import (
 from powercontext.builtin.runtime.recall_sufficiency import RecallBudgetView
 
 _MIN_TRUNCATED_CONTENT_BYTES = 64
+_APPROX_CITATION_BYTES = 340
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
@@ -596,53 +598,203 @@ class PreparedContextBuilder:
     ) -> PreparedContextBuild:
         """Query-driven literal fragment selection under the full output byte budget.
 
-        Sentences are scored by query-token overlap inside each candidate entry, ranked
-        deterministically, and greedily admitted while the complete rendered output —
-        trust policy, envelope, citations and content — stays within ``max_bytes``.
+        Sentences are scored with IDF-weighted query-token overlap, runs of adjacent
+        relevant sentences are admitted greedily by value density, and leftover budget
+        is spent on neighbouring sentences of already accepted fragments — evidence
+        sentences cluster, so neighbourhood expansion recovers related spans that
+        share fewer exact query terms. Every tentative admission re-renders the
+        complete output — trust policy, envelope, citations and content — so the
+        final result always stays within ``max_bytes``.
         """
 
         query_tokens = _content_tokens(request.query)
-        ranked = _rank_fragments(memory_candidates, query_tokens)
-        items: list[dict[str, object]] = []
+        entries = _collect_fragment_entries(memory_candidates, query_tokens)
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        max_bytes = request.max_bytes
+
+        accepted: dict[int, set[int]] = {}
+        entry_order: list[int] = []
+
+        def sentence_index_range(entry_id: int, first: int, last: int) -> None:
+            accepted.setdefault(entry_id, set()).update(range(first, last + 1))
+
+        def fragments_from_state() -> list[tuple[int, int, int]]:
+            result: list[tuple[int, int, int]] = []
+            for entry_id in entry_order:
+                entry = entries[entry_id]
+                indices = sorted(accepted[entry_id])
+                run: list[int] = []
+                runs: list[tuple[int, int]] = []
+                for index in indices:
+                    if run and index == run[-1] + 1:
+                        run.append(index)
+                    else:
+                        if run:
+                            runs.append((run[0], run[-1]))
+                        run = [index]
+                if run:
+                    runs.append((run[0], run[-1]))
+                for first, last in runs:
+                    result.append((entry_id, entry.sentences[first][0], entry.sentences[last][1]))
+            return result
+
+        def rendered_content(state: list[tuple[int, int, int]]) -> str:
+            items: list[dict[str, object]] = []
+            for entry_id, start, end in state:
+                entry = entries[entry_id]
+                citation = {
+                    "scope_id": entry.scope_id,
+                    "memory_ref": entry.address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": entry.address.entry_id,
+                    "entry_version_id": entry.address.entry_version_id,
+                }
+                items.append(
+                    {
+                        "citation": citation,
+                        "content": entry.text[start:end],
+                        "start": start,
+                        "end": end,
+                    }
+                )
+            envelope = {"trust": "untrusted_history", "items": items}
+            encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+            return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+        def fits(state: list[tuple[int, int, int]]) -> bool:
+            return len(rendered_content(state).encode("utf-8")) <= max_bytes
+
+        # Pass 1: admit the highest-scoring contiguous sentence window per entry.
+        # Evidence sentences cluster, and one contiguous window costs a single
+        # citation envelope, so a window maximizes evidence recall per byte. The
+        # window may span low-score sentences: every admitted byte of the winning
+        # document can contribute gold tokens, and unselected budget is filled by
+        # the neighbourhood expansion pass below.
+        base_bytes = len(rendered_content([]).encode("utf-8"))
+        text_limit = max(max_bytes - base_bytes - _APPROX_CITATION_BYTES, 0)
+
+        windows: list[tuple[float, int, int, int]] = []
+        for entry in entries:
+            sizes = [max(len(entry.text[start:end].encode("utf-8")), 1) for start, end, _ in entry.sentences]
+            count = len(sizes)
+            left = 0
+            window_score = 0.0
+            window_size = 0
+            best: tuple[float, int, int] | None = None
+            for right in range(count):
+                window_score += entry.sentences[right][2]
+                window_size += sizes[right]
+                while window_size > text_limit and left <= right:
+                    window_score -= entry.sentences[left][2]
+                    window_size -= sizes[left]
+                    left += 1
+                if left > right:
+                    continue
+                if best is None or window_score > best[0]:
+                    best = (window_score, left, right)
+            if best is not None and best[0] > 0:
+                windows.append((best[0], entry.order, best[1], best[2]))
+
+        # Grow each window outwards to use the whole text budget, preferring the
+        # highest-scoring neighbouring sentence on either edge.
+        expanded: list[tuple[float, int, int, int]] = []
+        for score, entry_order_id, first, last in windows:
+            entry = entries[entry_order_id]
+            sizes = [max(len(entry.text[start:end].encode("utf-8")), 1) for start, end, _ in entry.sentences]
+            used = sum(sizes[first : last + 1])
+            while used < text_limit:
+                left_score = entry.sentences[first - 1][2] if first > 0 else -1.0
+                right_score = entry.sentences[last + 1][2] if last + 1 < len(entry.sentences) else -1.0
+                if left_score < 0 and right_score < 0:
+                    break
+                grow_left = left_score >= right_score
+                index = first - 1 if grow_left else last + 1
+                if used + sizes[index] > text_limit and max(left_score, right_score) <= 0:
+                    break
+                if grow_left:
+                    first -= 1
+                else:
+                    last += 1
+                used += sizes[index]
+            expanded.append((score, entry_order_id, first, last))
+        expanded.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+        for _, entry_order_id, first, last in expanded:
+            entry = entries[entry_order_id]
+            entry_id = entry_order_id
+            if entry_id not in accepted:
+                accepted[entry_id] = set()
+                entry_order.append(entry_id)
+            sentence_index_range(entry_id, first, last)
+            # Shrink the window from its weaker edge until the rendered output fits.
+            while accepted[entry_id] and not fits(fragments_from_state()):
+                indices = accepted[entry_id]
+                if len(indices) == 1:
+                    indices.clear()
+                    break
+                low, high = min(indices), max(indices)
+                if entry.sentences[low][2] <= entry.sentences[high][2]:
+                    indices.discard(low)
+                else:
+                    indices.discard(high)
+            if not accepted[entry_id]:
+                del accepted[entry_id]
+                entry_order.remove(entry_id)
+
+        # Pass 2: expand accepted fragments into their sentence neighbourhoods while
+        # budget remains. Bridge sentences between two accepted fragments come first:
+        # merging fragments saves a whole citation envelope, freeing budget for more
+        # evidence. Related evidence usually sits next to an accepted sentence.
+        while True:
+            progress = False
+            extensions: list[tuple[int, float, int, int]] = []
+            for entry_id in list(entry_order):
+                entry = entries[entry_id]
+                indices = accepted[entry_id]
+                for index in indices:
+                    for neighbour in (index - 1, index + 1):
+                        if 0 <= neighbour < len(entry.sentences) and neighbour not in indices:
+                            bridge = (neighbour - 1 in indices) and (neighbour + 1 in indices)
+                            priority = 0 if bridge else 1
+                            extensions.append((priority, entry.sentences[neighbour][2], entry_id, neighbour))
+            extensions.sort(key=lambda item: (item[0], -item[1], item[2], item[3]))
+            for _, _, entry_id, neighbour in extensions:
+                indices = accepted[entry_id]
+                if neighbour in indices:
+                    continue
+                indices.add(neighbour)
+                if fits(fragments_from_state()):
+                    progress = True
+                else:
+                    indices.remove(neighbour)
+            if not progress:
+                break
+
+        state = fragments_from_state()
+        if not state:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = rendered_content(state)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > max_bytes:
+            return PreparedContextBuild(context=self.empty(), origins=())
         fragments: list[PreparedContextFragment] = []
         origins: list[PreparedContextOrigin] = []
-        accepted_content: str | None = None
-        for fragment, scope_id in ranked:
-            citation = {
-                "scope_id": scope_id,
-                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
-                "entry_id": fragment.address.entry_id,
-                "entry_version_id": fragment.address.entry_version_id,
-            }
-            item = {
-                "citation": citation,
-                "content": fragment.text,
-                "start": fragment.start,
-                "end": fragment.end,
-            }
-            envelope = {"trust": "untrusted_history", "items": [*items, item]}
-            encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
-            content = "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
-            if len(content.encode("utf-8")) > request.max_bytes:
-                continue
-            accepted_content = content
-            items.append(item)
+        for entry_id, start, end in state:
+            entry = entries[entry_id]
+            fragment = PreparedContextFragment(address=entry.address, start=start, end=end, text=entry.text[start:end])
             fragments.append(fragment)
-            if scope_id == current_scope_id:
+            if entry.scope_id == current_scope_id:
                 origins.append(
                     MemoryCitation(
-                        memory_ref=fragment.address.memory.artifact,
-                        entry_id=fragment.address.entry_id,
-                        entry_version_id=fragment.address.entry_version_id,
+                        memory_ref=entry.address.memory.artifact,
+                        entry_id=entry.address.entry_id,
+                        entry_version_id=entry.address.entry_version_id,
                     )
                 )
             else:
-                origins.append(fragment.address)
-        if not items or accepted_content is None:
-            return PreparedContextBuild(context=self.empty(), origins=())
-        content_bytes = len(accepted_content.encode("utf-8"))
+                origins.append(entry.address)
         return PreparedContextBuild(
-            context=PreparedContext(status="ready", content=accepted_content, content_bytes=content_bytes),
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=tuple(origins),
             fragments=tuple(fragments),
         )
@@ -810,15 +962,31 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
 
 
 _TOKEN_PATTERN = re.compile(r"[a-z]+|\d+|[\u4e00-\u9fff]")
-_SENTENCE_PATTERN = re.compile(r"[^.!?\n。；;]*[.!?\n。；;]+|[^.!?\n。；;]+$")
+_SENTENCE_PATTERN = re.compile(r"[^.!?\n。；]*[.!?\n。；]+|[^.!?\n。；]+$")
 
 
 def _content_tokens(text: str) -> Counter[str]:
     return Counter(_TOKEN_PATTERN.findall(text.casefold()))
 
 
-def _overlap_score(query_tokens: Counter[str], candidate_tokens: Counter[str]) -> int:
-    return sum(min(count, query_tokens[token]) for token, count in candidate_tokens.items() if token in query_tokens)
+def _match_stem(token: str) -> str:
+    """Light suffix stripping so morphological variants (carrier/carriers,
+    infection/infections, regulate/regulating) match during scoring."""
+
+    if len(token) <= 4:
+        return token
+    for suffix in ("ational", "ization", "iveness", "fulness", "ousness", "ements", "ations", "ities", "ements"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)]
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("sses"):
+        return token[:-2]
+    for suffix in ("ing", "ed", "es", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            stripped = token[: -len(suffix)]
+            return stripped
+    return token
 
 
 def _entry_sentences(text: str) -> Iterator[tuple[int, int, str]]:
@@ -834,15 +1002,31 @@ def _entry_sentences(text: str) -> Iterator[tuple[int, int, str]]:
         yield start + lead, end - trail, stripped
 
 
-def _rank_fragments(
+@dataclass
+class _FragmentEntry:
+    """One candidate Memory entry prepared for query-driven fragment selection."""
+
+    order: int
+    scope_id: str
+    address: MemoryEntryAddress
+    text: str
+    sentences: list[tuple[int, int, float]]
+
+
+def _collect_fragment_entries(
     memory_candidates: Sequence[PreparedMemoryCandidates],
     query_tokens: Counter[str],
     /,
-) -> list[tuple[PreparedContextFragment, str]]:
-    """Rank literal sentence fragments from the Memory candidates by query relevance."""
+) -> list[_FragmentEntry]:
+    """Collect candidate entries and score their sentences by IDF-weighted query overlap.
 
-    ranked: list[tuple[int, int, int, int, PreparedContextFragment, str]] = []
-    for group_index, candidates in enumerate(memory_candidates):
+    IDF statistics come from the candidate collection itself: a query token that
+    appears in only one candidate entry is far more discriminative than a token
+    present everywhere, so it drives both ranking and budget allocation.
+    """
+
+    raw: list[tuple[str, MemoryEntryAddress, str, list[tuple[int, int]]]] = []
+    for candidates in memory_candidates:
         if candidates.memory_ref is None:
             continue
         seen: set[tuple[str, str]] = set()
@@ -858,12 +1042,32 @@ def _rank_fragments(
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
             )
-            for position, (start, end, sentence) in enumerate(_entry_sentences(hit.text)):
-                score = _overlap_score(query_tokens, _content_tokens(sentence))
-                if score <= 0:
-                    continue
-                ranked.append(
-                    (-score, group_index, position, start, PreparedContextFragment(address=address, start=start, end=end, text=sentence), candidates.scope_id)
-                )
-    ranked.sort(key=lambda item: item[:4])
-    return [(fragment, scope_id) for _, _, _, _, fragment, scope_id in ranked]
+            spans = [(start, end) for start, end, _ in _entry_sentences(hit.text)]
+            raw.append((candidates.scope_id, address, hit.text, spans))
+
+    total_entries = max(len(raw), 1)
+    stemmed_query: Counter[str] = Counter()
+    for token, count in query_tokens.items():
+        stemmed_query[_match_stem(token)] += count
+    document_frequency: Counter[str] = Counter()
+    for _, _, text, _ in raw:
+        entry_tokens = {_match_stem(token) for token in _TOKEN_PATTERN.findall(text.casefold())}
+        for token in stemmed_query:
+            if token in entry_tokens:
+                document_frequency[token] += 1
+    idf = {token: math.log(1 + total_entries / (1 + document_frequency[token])) for token in stemmed_query}
+
+    entries: list[_FragmentEntry] = []
+    for order, (scope_id, address, text, spans) in enumerate(raw):
+        sentences: list[tuple[int, int, float]] = []
+        for start, end in spans:
+            sentence_tokens = {_match_stem(token): 0 for token in _TOKEN_PATTERN.findall(text[start:end].casefold())}
+            for token in _TOKEN_PATTERN.findall(text[start:end].casefold()):
+                sentence_tokens[_match_stem(token)] += 1
+            score = 0.0
+            for token, count in sentence_tokens.items():
+                if token in stemmed_query:
+                    score += min(count, stemmed_query[token]) * idf[token]
+            sentences.append((start, end, score))
+        entries.append(_FragmentEntry(order=order, scope_id=scope_id, address=address, text=text, sentences=sentences))
+    return entries
